@@ -239,7 +239,9 @@ int main(int argc, char** argv) {
             cur_record = 0;
         }
     }
+#if DEBUG > 1
     fprintf(logfp, "cur_record=%d\n", cur_record);
+#endif
     if (cur_record != 0) {
         int i;
         // write logs!
@@ -300,12 +302,14 @@ FILE* make_logfile(char* prefix) {
 }
 
 void write_metadata(FILE* fp, int argc, char** argv, int target_pid) {
+    int self_pid = getpid();
     int i;
     fprintf(fp, "# cmdline:");
     for (i = 1; i < argc; i++) {
         fprintf(fp, " %s", argv[i]);
     }
     fprintf(fp, "\n");
+    fprintf(fp, "# self_pid: %d\n", self_pid);
     fprintf(fp, "# target_pid: %d\n", target_pid);
     return;
 }
