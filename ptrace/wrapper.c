@@ -250,6 +250,7 @@ int main(int argc, char** argv) {
             output_log(logfp, rs[i]);
         }
     }
+    free(rs);
     return 0;
 }
 
@@ -262,6 +263,7 @@ void output_log(FILE* fp, struct record r) {
         fprintf(fp, "%d\n", r.u.c.fd);
     } else if (r.syscall == __NR_open) {
         fprintf(fp, "%d %s\n", r.u.o.fd, r.u.o.path);
+        free(r.u.o.path);
     } else if (r.syscall == __NR_write) {
         fprintf(fp, "%d %lu\n", r.u.w.fd, r.u.w.size);
     }
