@@ -1,0 +1,6 @@
+*.o
+*~
+*.cmd
+a.out
+wrapper
+
