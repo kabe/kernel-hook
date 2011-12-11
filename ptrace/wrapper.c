@@ -8,18 +8,106 @@
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
-#include "syscall_names.h"
+#include <time.h>
+#include <string.h>
+#include "util.h"
 
+#define DEBUG 0
+
+#if DEBUG > 0
+#include "syscall_names.h"
+#endif
+
+typedef enum syscall_kind {
+    syscall_kind_entry,
+    syscall_kind_exit
+} syscall_kind_t;
+
+struct record {
+    int syscall;
+    syscall_kind_t kind;
+    pid_t pid;
+    struct timespec timestamp;
+    union {
+        /* read */
+        struct {
+            int fd;
+            size_t size;
+        } r;
+        /* write */
+        struct {
+            int fd;
+            size_t size;
+        } w;
+        /* open */
+        struct {
+            int fd;
+            char* path;
+        } o;
+        /* close */
+        struct {
+            int fd;
+        } c;
+    } u;
+};
+
+FILE* make_logfile();
+void write_metadata(FILE* fp, int argc, char** argv, int target_pid);
+void output_log(FILE* fp, struct record r);
 void getpath(char* path, int pid, unsigned long pathaddr);
+
+void config_record_open(struct record* rec, int syscall, syscall_kind_t kind, pid_t pid, int fd, const char* path) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    rec->syscall = syscall;
+    rec->kind = kind;
+    rec->pid = pid;
+    memcpy(&rec->timestamp, &ts, sizeof(struct timespec));
+    rec->u.o.fd = fd;
+    rec->u.o.path = safe_strdup(path);
+    return;
+}
+
+void config_record_close(struct record* rec, int syscall, syscall_kind_t kind, pid_t pid, int fd) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    rec->syscall = syscall;
+    rec->kind = kind;
+    rec->pid = pid;
+    memcpy(&rec->timestamp, &ts, sizeof(struct timespec));
+    rec->u.c.fd = fd;
+    return;
+}
+
+void config_record_read(struct record* rec, int syscall, syscall_kind_t kind, pid_t pid, int fd, size_t size) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    rec->syscall = syscall;
+    rec->kind = kind;
+    rec->pid = pid;
+    memcpy(&rec->timestamp, &ts, sizeof(struct timespec));
+    rec->u.r.fd = fd;
+    rec->u.r.size= size;
+    return;
+}
+
+void config_record_write(struct record* rec, int syscall, syscall_kind_t kind, pid_t pid, int fd, size_t size) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    rec->syscall = syscall;
+    rec->kind = kind;
+    rec->pid = pid;
+    memcpy(&rec->timestamp, &ts, sizeof(struct timespec));
+    rec->u.w.fd = fd;
+    rec->u.w.size = size;
+    return;
+}
+
 
 int main(int argc, char** argv) {
     long ret;
     int pid, newpid;
     int status, waitpid_options = 0;
-    void* data;
-    int syscall;
-    struct user_regs_struct u_in;
-    char path[PATH_MAX];
     pid = fork();
     if(pid) { // parent
         wait(&status);
@@ -39,7 +127,21 @@ int main(int argc, char** argv) {
         argv[argc] = 0;
         execvp(argv[1], argv + 1);
     }
+    /* Prepare a log file */
+    FILE* logfp = make_logfile("log/");
+    write_metadata(logfp, argc, argv, pid);
     // pid's purpose changed
+    int syscall;
+    struct user_regs_struct u_in;
+    char path[PATH_MAX];
+    int syscall_fd;  // I/O argument 'fd'
+    size_t syscall_size;  // read/write argument 'size'
+    /* prepare logging */
+    int nr_records = 100;
+    int cur_record = 0;
+    struct record* rs;
+    rs = (struct record*)safe_malloc(sizeof(struct record) * nr_records);
+    /* main loop */
     while(1) {
         pid = waitpid(-1, &status, waitpid_options);
         if (pid < 0) {
@@ -53,55 +155,165 @@ int main(int argc, char** argv) {
             continue;
         } else if (WIFSIGNALED(status)) {
             continue;
-        }        /* Check the GP register and get the system call number*/
+        }
+        /* Check the GP register and get the system call number*/
         ptrace(PTRACE_GETREGS, pid, 0, &u_in);
         syscall = u_in.orig_rax;
         if(u_in.rax == -ENOSYS) {
             /* Entry hook */
             if(syscall == __NR_open) {
                 getpath(path, pid, u_in.rdi);
-                printf("(pid=%d) %s\n", pid, syscall_names[syscall]); /* System call name */
-                printf("%s ", syscall_names[syscall]); /* System call name */
-                printf("%08lx(%s) ", u_in.rdi, (char*)path); /* Address of the path */
-                printf("%08lx ", u_in.rsi); /* Flag */
-                printf("%08lx\n", u_in.rdx); /* Mode */
+                config_record_open(rs + cur_record, syscall, syscall_kind_entry,
+                        pid, 0, path);
+                cur_record++;
+            } else if (syscall == __NR_close) {
+                syscall_fd = u_in.rdi;
+                config_record_close(rs + cur_record, syscall, syscall_kind_entry,
+                        pid, syscall_fd);
+                cur_record++;
+            } else if (syscall == __NR_read) {
+                syscall_fd = u_in.rdi;
+                // buf is rsi
+                syscall_size = u_in.rdx;
+                config_record_read(rs + cur_record, syscall, syscall_kind_entry,
+                        pid, syscall_fd, syscall_size);
+                cur_record++;
+            } else if (syscall == __NR_write) {
+                syscall_fd = u_in.rdi;
+                // buf is rsi
+                syscall_size = u_in.rdx;
+                config_record_write(rs + cur_record, syscall, syscall_kind_entry,
+                        pid, syscall_fd, syscall_size);
+                cur_record++;
             } else {
-                printf("(pid=%d) Syscall: %s\n", pid, syscall_names[syscall]);
             }
         } else {
             /* Exit hook */
             long retvalue = u_in.rax;
             if(syscall == __NR_fork) {
                 newpid = retvalue;
-                printf("(pid=%d) fork hooked: newpid = %d\n", pid, newpid);
                 ptrace(PTRACE_ATTACH, newpid, NULL, NULL);
                 ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
             } else if(syscall == __NR_clone) {
                 newpid = retvalue;
-                printf("(pid=%d) clone hooked: newpid = %d\n", pid, newpid);
                 ptrace(PTRACE_ATTACH, newpid, NULL, NULL);
                 ptrace(PTRACE_SYSCALL, newpid, NULL, NULL);
             } else if(syscall == __NR_vfork) {
                 newpid = retvalue;
-                printf("(pid=%d) vfork hooked: newpid = %d\n", pid, newpid);
                 ptrace(PTRACE_ATTACH, newpid, NULL, NULL);
                 ptrace(PTRACE_SYSCALL, newpid, NULL, NULL);
-            } else {
-                newpid = u_in.rax;
-                printf("(pid=%d) some called: v=%d\n", pid, newpid);
+            } else if(syscall == __NR_open) {
+                syscall_fd = retvalue;
+                config_record_open(rs + cur_record, syscall, syscall_kind_exit,
+                        pid, syscall_fd, NULL);
+                cur_record++;
+            } else if(syscall == __NR_close) {
+                syscall_fd = u_in.rdi;
+                config_record_close(rs + cur_record, syscall, syscall_kind_exit,
+                        pid, syscall_fd);
+                cur_record++;
+            } else if(syscall == __NR_read) {
+                syscall_fd = u_in.rdi;
+                syscall_size = u_in.rsi;
+                config_record_read(rs + cur_record, syscall, syscall_kind_exit,
+                        pid, syscall_fd, 0);
+                cur_record++;
+            } else if(syscall == __NR_write) {
+                syscall_fd = u_in.rdi;
+                syscall_size = u_in.rsi;
+                config_record_write(rs + cur_record, syscall, syscall_kind_exit,
+                        pid, syscall_fd, 0);
+                cur_record++;
             }
         }
         // release
         ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
         // output log if necessary
+        if (cur_record + 1 == nr_records) {
+            int i;
+            // write logs!
+            for(i = 0; i < cur_record; i++) {
+                //struct record r = rs[i];
+                output_log(logfp, rs[i]);
+            }
+            cur_record = 0;
+        }
+    }
+    fprintf(logfp, "cur_record=%d\n", cur_record);
+    if (cur_record != 0) {
+        int i;
+        // write logs!
+        for(i = 0; i < cur_record; i++) {
+            //struct record r = rs[i];
+            output_log(logfp, rs[i]);
+        }
     }
     return 0;
+}
+
+void output_log(FILE* fp, struct record r) {
+    fprintf(fp, "%d %d %d %ld.%09ld ", r.syscall, r.kind, r.pid, r.timestamp.tv_sec,
+            r.timestamp.tv_nsec);
+    if (r.syscall == __NR_read) {
+        fprintf(fp, "%d %lu\n", r.u.r.fd, r.u.r.size);
+    } else if (r.syscall == __NR_close) {
+        fprintf(fp, "%d\n", r.u.c.fd);
+    } else if (r.syscall == __NR_open) {
+        fprintf(fp, "%d %s\n", r.u.o.fd, r.u.o.path);
+    } else if (r.syscall == __NR_write) {
+        fprintf(fp, "%d %lu\n", r.u.w.fd, r.u.w.size);
+    }
+}
+
+/**
+ * Create a log file that has unique file name.
+ */
+FILE* make_logfile(char* prefix) {
+    int i;
+    int self_pid = getpid();
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    unsigned long hash = 0;
+    // host name hashing
+    unsigned long name_hash = 0;
+    char hostname[HOST_NAME_MAX + 1];
+    gethostname(hostname, HOST_NAME_MAX);
+    assert(hostname[HOST_NAME_MAX - 1] == '\0');
+    for (i = 0; hostname[i]; i++) {
+        name_hash += i * hostname[i];
+    }
+    // time hashing
+    unsigned time_hash = 0;
+    time_hash = ts.tv_sec ^ ts.tv_nsec;
+    // hashing
+    hash = time_hash ^ (name_hash << 32) ^ self_pid;
+    // create a file name
+    char filename[NAME_MAX];
+    sprintf(filename, "%s%ld.%d.log", prefix, hash, self_pid);
+    // create a file
+    FILE* fp = fopen(filename, "w");
+    if(!fp) {
+        perror("fopen");
+        exit(2);
+    }
+    return fp;
+}
+
+void write_metadata(FILE* fp, int argc, char** argv, int target_pid) {
+    int i;
+    fprintf(fp, "# cmdline:");
+    for (i = 1; i < argc; i++) {
+        fprintf(fp, " %s", argv[i]);
+    }
+    fprintf(fp, "\n");
+    fprintf(fp, "# target_pid: %d\n", target_pid);
+    return;
 }
 
 void getpath(char* path, int pid, unsigned long pathaddr) {
     int i;
     errno = 0;
-    jjfor (i = 0; i < PATH_MAX; i++) {
+    for (i = 0; i < PATH_MAX; i++) {
         if ((i & 0x7) == 0) {
             unsigned long chunk = ptrace(PTRACE_PEEKDATA, pid, (char *)(pathaddr + i), 0);
             if (errno != 0)
@@ -145,4 +357,6 @@ void getpath(char* path, int pid, unsigned long pathaddr) {
    unsigned long gs;
    };
    */
+
+/* vim: set ts=4 : */
 
